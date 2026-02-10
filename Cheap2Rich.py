@@ -6,6 +6,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import Lasso
 import copy
 import os
 import time
@@ -366,20 +368,46 @@ class LatentGAN(nn.Module):
 
 LF_EPOCHS = 160
 GAN_EPOCHS = 160
-HF_EPOCHS = 220
-HF_FINE_TUNE_EPOCHS = 120
+HF_EPOCHS = 120
+HF_FINE_TUNE_EPOCHS = 80
+
+class LatentSINDy:
+    """Polynomial sparse aligner for latent dynamics."""
+
+    def __init__(self, latent_dim, degree=2, alpha=1e-3):
+        self.latent_dim = latent_dim
+        self.poly = PolynomialFeatures(degree=degree, include_bias=False)
+        self.model = Lasso(alpha=alpha, max_iter=10000)
+        self.trained = False
+
+    def fit(self, z_sim, z_real):
+        sim = z_sim.detach().cpu().numpy()[:80]
+        real = z_real.detach().cpu().numpy()[:80]
+        delta = real - sim
+        features = self.poly.fit_transform(sim)
+        self.model.fit(features, delta)
+        self.trained = True
+
+    def align(self, z):
+        if not self.trained:
+            return z
+        inp = z.detach().cpu().numpy()
+        features = self.poly.transform(inp)
+        delta = self.model.predict(features).astype(np.float32)
+        delta_tensor = torch.from_numpy(delta).to(z.device).to(z.dtype)
+        return z + delta_tensor
 
 class SparseFreqDASHRED(nn.Module):
     """DA-SHRED with sparse-frequency HF learning"""
 
-    def __init__(self, lf_shred, num_sensors, lags, hidden_size, output_size, sensor_indices):
+    def __init__(self, lf_shred, num_sensors, lags, hidden_size, output_size, sensor_indices, latent_aligner=None):
         super().__init__()
 
         # LF pathway
         self.lf_lstm = copy.deepcopy(lf_shred.lstm)
         self.lf_norm = copy.deepcopy(lf_shred.norm)
         self.lf_decoder = copy.deepcopy(lf_shred.decoder)
-        self.gan = LatentGAN(lf_shred.hidden_size)
+        self.latent_aligner = latent_aligner
 
         # HF pathway with enhanced temporal processing + spatial deformation
         # The HF patterns have spatially and temporally varying velocity
@@ -394,6 +422,12 @@ class SparseFreqDASHRED(nn.Module):
         self.num_sensors = num_sensors
         self.output_size = output_size
 
+
+    def align_latent(self, z):
+        if self.latent_aligner is None:
+            return z
+        return self.latent_aligner.align(z)
+
     def encode_lf(self, x):
         _, (h_n, _) = self.lf_lstm(x)
         return self.lf_norm(h_n[-1])
@@ -406,8 +440,7 @@ class SparseFreqDASHRED(nn.Module):
 
         # LF pathway
         z_lf = self.encode_lf(sensor_history)
-        if use_gan:
-            z_lf = self.gan(z_lf)
+        z_lf = self.align_latent(z_lf)
         u_lf = self.decode_lf(z_lf)
 
         # Compute residual history
@@ -447,49 +480,14 @@ def train_lf_shred(model, train_loader, epochs=200, lr=1e-3):
     return model
 
 
-def train_gan(dashred, z_sim, z_real, epochs=300, lr=1e-4):
-    print("\n=== Stage 2: Train GAN for LF Alignment ===")
+def train_sindy(dashred, z_sim, z_real, aligner, epochs=160):
+    print("=== Stage 2: Train latent SINDy aligner ===")
 
-    z_sim = torch.tensor(z_sim, dtype=torch.float32).to(device)
-    z_real = torch.tensor(z_real, dtype=torch.float32).to(device)
-
-    opt_g = optim.Adam(dashred.gan.generator.parameters(), lr=lr)
-    opt_d = optim.Adam(dashred.gan.discriminator.parameters(), lr=lr)
-
-    batch_size = 32
-    n_batches = min(len(z_sim), len(z_real)) // batch_size
-
-    for epoch in range(epochs):
-        perm_sim = torch.randperm(len(z_sim))
-        perm_real = torch.randperm(len(z_real))
-
-        for i in range(n_batches):
-            z_s = z_sim[perm_sim[i * batch_size:(i + 1) * batch_size]]
-            z_r = z_real[perm_real[i * batch_size:(i + 1) * batch_size]]
-
-            # Discriminator
-            opt_d.zero_grad()
-            z_fake = dashred.gan(z_s)
-            d_loss = F.binary_cross_entropy_with_logits(
-                dashred.gan.discriminator(z_r), torch.ones(len(z_r), 1, device=device)
-            ) + F.binary_cross_entropy_with_logits(
-                dashred.gan.discriminator(z_fake.detach()), torch.zeros(len(z_s), 1, device=device)
-            )
-            d_loss.backward()
-            opt_d.step()
-
-            # Generator
-            opt_g.zero_grad()
-            z_fake = dashred.gan(z_s)
-            g_loss = F.binary_cross_entropy_with_logits(
-                dashred.gan.discriminator(z_fake), torch.ones(len(z_s), 1, device=device)
-            )
-            g_loss.backward()
-            opt_g.step()
-
-        if (epoch + 1) % 100 == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}, G_loss: {g_loss.item():.4f}, D_loss: {d_loss.item():.4f}")
-
+    z_sim_tensor = torch.tensor(z_sim, dtype=torch.float32).to(device)
+    z_real_tensor = torch.tensor(z_real, dtype=torch.float32).to(device)
+    aligner.fit(z_sim_tensor, z_real_tensor)
+    dashred.latent_aligner = aligner
+    print("Latent SINDy aligner fitted.")
 
 def train_hf_sparse(dashred, train_loader_real, sensor_indices, epochs=500, lr=1e-3,
                     lambda_sparse=0.1, sparsity_type='bandlimited', stage_name="Stage 3"):
@@ -762,8 +760,8 @@ if __name__ == "__main__":
     print("\n[4] Creating SparseFreq DA-SHRED...")
     dashred = SparseFreqDASHRED(lf_shred, num_sensors, lags, hidden_size, N, sensor_indices).to(device)
 
-    # Stage 2: Extract latents and train GAN
-    print("\n[5] Extracting latents for GAN...")
+    # Stage 2: Extract latents and train the SINDy aligner
+    print("\n[5] Extracting latents for alignment...")
     dashred.eval()
     Z_sim_list, Z_real_list = [], []
     with torch.no_grad():
@@ -779,11 +777,11 @@ if __name__ == "__main__":
     print(f"    Z_sim mean: {Z_sim.mean():.4f}, std: {Z_sim.std():.4f}")
     print(f"    Z_real mean: {Z_real.mean():.4f}, std: {Z_real.std():.4f}")
 
-    print("\n[6] Stage 2: Train GAN...")
-    train_gan(dashred, Z_sim, Z_real, epochs=GAN_EPOCHS)
-    time_to_train_gan = time.time() - start_time - time_to_train_lf
-    print(f"    Time to train GAN: {time_to_train_gan:.2f} seconds ({time_to_train_gan/60:.2f} minutes)")
-    
+    print("\n[6] Stage 2: Train latent SINDy aligner...")
+    sindy_aligner = LatentSINDy(lf_shred.hidden_size, degree=2, alpha=1e-3)
+    train_sindy(dashred, Z_sim, Z_real, sindy_aligner, epochs=GAN_EPOCHS)
+    time_to_train_sindy = time.time() - start_time - time_to_train_lf
+    print(f"    Time to train SINDy aligner: {time_to_train_sindy:.2f} seconds ({time_to_train_sindy/60:.2f} minutes)")
 
     # Diagnostic: Check sensor residual
     print("\n[6.5] DIAGNOSTIC: Checking sensor residual...")
@@ -795,7 +793,7 @@ if __name__ == "__main__":
         sample_targets = sample_targets.to(device)
 
         z_lf = dashred.encode_lf(sample_sensors)
-        z_lf_aligned = dashred.gan(z_lf)
+        z_lf_aligned = dashred.align_latent(z_lf)
         u_lf = dashred.decode_lf(z_lf_aligned)
 
         sensors_current = sample_sensors[:, -1, :]
@@ -834,7 +832,7 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in dashred.parameters())
     trainable_params = sum(p.numel() for p in dashred.parameters() if p.requires_grad)
     print(f"\n[Summary] Total parameters in DA-SHRED: {total_params}, Trainable parameters: {trainable_params}")
-    time_to_train_hf = time.time() - start_time - time_to_train_lf - time_to_train_gan
+    time_to_train_hf = time.time() - start_time - time_to_train_lf - time_to_train_sindy
     print(f"    Time to train HF-SHRED: {time_to_train_hf:.2f} seconds ({time_to_train_hf/60:.2f} minutes)")
 
     # Evaluate
@@ -848,7 +846,7 @@ if __name__ == "__main__":
             sensors = sensors.to(device)
 
             z_lf = dashred.encode_lf(sensors)
-            z_lf_aligned = dashred.gan(z_lf)
+            z_lf_aligned = dashred.align_latent(z_lf)
             u_lf = dashred.decode_lf(z_lf_aligned)
 
             u_total, _, u_hf, _, _ = dashred(sensors, use_gan=True)
@@ -1073,7 +1071,7 @@ if __name__ == "__main__":
         for sensors, targets in full_real_loader:
             sensors = sensors.to(device)
             z_lf = dashred.encode_lf(sensors)
-            z_lf_aligned = dashred.gan(z_lf)
+            z_lf_aligned = dashred.align_latent(z_lf)
             u_lf = dashred.decode_lf(z_lf_aligned)
             u_total, _, _, _, _ = dashred(sensors, use_gan=True)
             full_results['lf_only'].append(u_lf.cpu())

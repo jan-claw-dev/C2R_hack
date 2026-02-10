@@ -8,3 +8,5 @@ jupyter
 notebook
 clawpack == 5.13.1
 scikit-image
+
+pysindy>=2.1.0

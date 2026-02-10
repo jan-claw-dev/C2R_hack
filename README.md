@@ -1,50 +1,45 @@
+# RDE-DA-SHRED Submission Bundle
 
-# Files for Submission
+This project pairs a flexible DA-SHRED stack (`Cheap2Rich.py`) with discovery scripts that probe latent and multi-scale structure in the rotated detonation engine (RDE) datasets. The repository contains the Koch-based low-fidelity simulations, the high-fidelity measurements, the LF/HF fusion code, and the auxiliary discovery scripts described below.
 
-This directory contains the implementation and data files for the RDE-DA-SHRED project, which focuses on rotating detonation engine (RDE) simulation and data-driven modeling.
+## Architecture overview
 
-## Contents
+- **LF Pathway:** Each sensor history is passed through a shallow LSTM (with optional temporal convolutions) and normalized to produce a latent representation, then decoded with a residual MLP.
+- **HF Pathway:** Sensor residuals are modeled by a DA-SHRED module that learns a high-frequency correction via spatial deformation, gating, and optional frequency-domain attention.
+- **Latent alignment:** Various experiments replace the old GAN with contrastive projection, Fourier-gated outputs, or a latent-space SINDy/Lasso aligner before decoding.
 
-### Main Implementation Files
+## Latest benchmark (latent SINDy aligner run)
 
-- **`Cheap2Rich.py`** - Core implementation of the data-driven model that transforms low-fidelity simulations to high-fidelity predictions
-- **`baselines_for_results.ipynb`** - Jupyter notebook containing baseline comparisons and results visualization
+| Branch | LF+HF RMSE | Full SSIM (LF+HF) | Notes |
+| --- | --- | --- | --- |
+| `main` | 0.1067 | 0.3574 | Baseline pipeline with GAN aligner + HF gating and frequency dropout. |
+| `contrastive-latent` | 0.1034 | 0.3657 | Replaces the GAN with a contrastive projector; very similar reconstruction but simpler training. |
+| `sindy-latent` | 0.1552 | 0.2073 | Fits a polynomial/Lasso aligner in the latent space prior to decoding—still improving RMSE though SSIM is lower while we tune convergence. |
 
-### Data Files
+*All runs use the provided `RDE_four_panel_comparison.png` and `sparse_freq_RDE_results.png` plots in the root directory for visual comparison.*
 
-- **`high_fidelity_1d_dataset.npy`** - High-fidelity simulation dataset (1D)
-- **`Kochs_model_dataset.npy`** - Raw dataset from Koch's model
+## Branch-specific notes
 
-- **`high_fidelity_sim_processed.npy`** - Processed high-fidelity simulation data
-- **`Koch_model_processed.npy`** - Processed data from Koch's model
+- `main`: Uses the GAN-based aligner plus the HF gating/frequency attention experiments described above. The run artifacts live in `RDE_*` PNGs.
+- `contrastive-latent`: Aligns LF latents with a contrastive projector and keeps the rest of the pipeline identical; see the same plots for comparison and this branch’s PR for implementation details.
+- `frequency-attn`: Adds a Fourier-domain gating layer that learns per-frequency multipliers before injecting HF corrections.
+- `sindy-latent`: Fits either SINDy or a Lasso+Polynomial aligner on the first 80 latent sample steps and uses the predicted delta to shift the decoded latents; the modified README and plots highlight the resulting RMSE/SSIM.
+- `sindy-discovery`: Contains the PySINDy discovery script (`scripts/sindy_discovery.py`) plus a `reports/sindy_*` summary of the identified latent equations.
+- `mamba-discovery`: Builds multi-scale Ricker features, fits a ridge model to the latent derivative, and saves the derivative/forecast plots under `reports/mamba_*`.
 
-### Configuration
+## Run artifacts
 
-- **`requirements.txt`** - Python package dependencies required to run the code
+- `RDE_four_panel_comparison.png` / `RDE_four_panel_validation.png`: Side-by-side animation of simulation, real data, LF-only, and LF+HF reconstructions.
+- `sparse_freq_RDE_results.png`: HF reconstruction + frequency spectrum.
+- Discovery plot files (`reports/sindy_*.png`, `reports/mamba_*.png`) illustrate derivative predictions for Koch/high-fidelity/residual fields.
 
-### Koch Model Data Generation
+## Discovery workflows
 
-The `Koch_model_data_generation/` subdirectory contains utilities for generating data with Koch's model :
+- **SINDy discovery** (`scripts/sindy_discovery.py`): Applies PySINDy to the Koch, high-fidelity, and residual datasets using five chosen sensor indices. Results appear in `reports/sindy_results.[md|json]`.
+- **MAMBA-style discovery** (`scripts/mamba_discovery.py`): Constructs time-frequency features with Ricker kernels and fits a ridge model; reports go to `reports/mamba_results.[md|json]`.
 
-- **`euler_1D_py.py`** - 1D Euler equation solver implementation
-- **`rde1d_3_waves.py`** - RDE simulation with 3-wave configuration
-- **`how_to_generate_data.md`** - Instructions for generating new simulation data
+## Getting started
 
-the output of `rde1d_3_waves.py` should be a `Kochs_model_dataset.npy` file which weighs over 160MB (hence it is not attached to the submission). It is preprocessed in the first cells of the `baselines_for_results.ipynb` notebook, so running the notebook first is recommended. Alternatively, the preprocessed datasets from both high fidelity and low fidelity simulations are attached and can be found in **`high_fidelity_sim_processed.npy`**, **`Koch_model_processed.npy`** and used for baselines and the Cheap2Rich model.
-
-## Getting Started
-
-1. Install dependencies (the code has been tested with Python 3.13.7):
-    ```bash
-    pip install -r requirements.txt
-    ```
-2. (Optional) Generate data from Koch's model using scripts in `Koch_model_data_generation/`. Follow the instructions regarding Clawpack and `euler_1D_py.py`. 
-
-3. (Optional, requires 2.) Review the baseline results notebook to understand the approach
-
-4. Run the main model using `Cheap2Rich.py`
-## SINDy physics discovery
-
-The `sindy-discovery` branch runs PySINDy on the Koch simulation, the high-fidelity measurement, and their residual to recover sparse polynomial equations in the chosen sensor coordinates. Each run saves a derivative comparison plot (`reports/sindy_<Label>.png`) so you can visually compare the predicted derivatives to the measured value for the first sensor.
-
-![SINDy derivative comparison](reports/sindy_Koch.png)
+1. Install dependencies (the repo bundles a `venv` for reference): `python -m venv venv && source venv/bin/activate && pip install -r requirements.txt`.
+2. Run `python Cheap2Rich.py` (or inspect `baselines_for_results.ipynb`) to reproduce the LF/HF training + reconstructions.
+3. Rerun the discovery scripts (and push their reports) if you change `SENSOR_INDICES`, thresholds, or aligner configurations.

@@ -112,6 +112,22 @@ class SHRED(nn.Module):
         return self.decoder(z), z
 
 
+class TemporalConvNet(nn.Module):
+    """Light temporal convolutional feature extractor for sensor history."""
+
+    def __init__(self, num_sensors, conv_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(num_sensors, conv_dim, kernel_size=3, padding=1),
+            nn.BatchNorm1d(conv_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(conv_dim, num_sensors, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x):
+        out = self.net(x.transpose(1, 2))
+        return out.transpose(1, 2)
+
 class HF_SHRED(nn.Module):
     """
     HF-SHRED for high-frequency residual learning.
@@ -123,7 +139,8 @@ class HF_SHRED(nn.Module):
     """
 
     def __init__(self, num_sensors, lags, hidden_size, output_size,
-                 velocity_correction='deformation', use_time_derivatives=True, use_lag_attention=True):
+                 velocity_correction='deformation', use_time_derivatives=True, use_lag_attention=True,
+                 use_temporal_conv=False, conv_dim=64, use_hf_gate=False):
         super().__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
@@ -132,6 +149,10 @@ class HF_SHRED(nn.Module):
         self.velocity_correction = velocity_correction
         self.use_time_derivatives = use_time_derivatives
         self.use_lag_attention = use_lag_attention
+        self.use_temporal_conv = use_temporal_conv
+        self.use_hf_gate = use_hf_gate
+        if use_temporal_conv:
+            self.temporal_conv = TemporalConvNet(num_sensors, conv_dim)
 
         # Input size depends on whether we use time derivatives
         if use_time_derivatives:
@@ -162,6 +183,11 @@ class HF_SHRED(nn.Module):
             nn.ReLU(),
             nn.Linear(128, output_size)
         )
+        if self.use_hf_gate:
+            self.gate_net = nn.Sequential(
+                nn.Linear(hidden_size, output_size),
+                nn.Sigmoid()
+            )
 
         # Velocity/deformation correction options
         if velocity_correction == 'frequency_phase':
@@ -207,12 +233,18 @@ class HF_SHRED(nn.Module):
 
         return torch.cat([x, dx_dt, d2x_dt2], dim=-1)
 
+    def preprocess_history(self, x):
+        if self.use_temporal_conv:
+            return self.temporal_conv(x)
+        return x
+
     def encode(self, x):
         """Encode with optional time derivatives and lag attention."""
+        x_processed = self.preprocess_history(x)
         if self.use_time_derivatives:
-            x_embedded = self.compute_time_derivatives(x)
+            x_embedded = self.compute_time_derivatives(x_processed)
         else:
-            x_embedded = x
+            x_embedded = x_processed
 
         if self.use_lag_attention:
             all_hidden, _ = self.lstm_all_steps(x_embedded)
@@ -290,6 +322,10 @@ class HF_SHRED(nn.Module):
         else:
             output = base_output
 
+        if self.use_hf_gate:
+            gate = self.gate_net(z)
+            output = output * gate
+
         return output, z
 
     def get_attention_weights(self):
@@ -328,6 +364,11 @@ class LatentGAN(nn.Module):
         return z + self.generator(z)
 
 
+LF_EPOCHS = 160
+GAN_EPOCHS = 160
+HF_EPOCHS = 220
+HF_FINE_TUNE_EPOCHS = 120
+
 class SparseFreqDASHRED(nn.Module):
     """DA-SHRED with sparse-frequency HF learning"""
 
@@ -345,7 +386,8 @@ class SparseFreqDASHRED(nn.Module):
         self.hf_shred = HF_SHRED(num_sensors, lags, hidden_size, output_size,
                                  velocity_correction='deformation',  # Spatially-varying warping
                                  use_time_derivatives=True,
-                                 use_lag_attention=True)
+                                 use_lag_attention=True,
+                                 use_temporal_conv=True, conv_dim=64, use_hf_gate=True)
 
         self.register_buffer('sensor_indices', torch.tensor(sensor_indices, dtype=torch.long))
         self.lags = lags
@@ -694,7 +736,7 @@ if __name__ == "__main__":
     start_time = time.time()
 
     lf_shred = SHRED(num_sensors, lags, hidden_size, N).to(device)
-    lf_shred = train_lf_shred(lf_shred, train_loader_sim, epochs=300)
+    lf_shred = train_lf_shred(lf_shred, train_loader_sim, epochs=LF_EPOCHS)
 
     # params of lf_shred
     total_params_lf = sum(p.numel() for p in lf_shred.parameters())
@@ -738,7 +780,7 @@ if __name__ == "__main__":
     print(f"    Z_real mean: {Z_real.mean():.4f}, std: {Z_real.std():.4f}")
 
     print("\n[6] Stage 2: Train GAN...")
-    train_gan(dashred, Z_sim, Z_real, epochs=400)
+    train_gan(dashred, Z_sim, Z_real, epochs=GAN_EPOCHS)
     time_to_train_gan = time.time() - start_time - time_to_train_lf
     print(f"    Time to train GAN: {time_to_train_gan:.2f} seconds ({time_to_train_gan/60:.2f} minutes)")
     
@@ -776,7 +818,7 @@ if __name__ == "__main__":
     print(f"\n[7] Stage 3: Train HF-SHRED with {sparsity_type} sparsity...")
     dashred, history = train_hf_sparse(
         dashred, train_loader_real, sensor_indices,
-        epochs=500, lambda_sparse=lambda_sparse, sparsity_type=sparsity_type,
+        epochs=HF_EPOCHS, lambda_sparse=lambda_sparse, sparsity_type=sparsity_type,
         stage_name="Stage 3"
     )
 
@@ -784,7 +826,7 @@ if __name__ == "__main__":
     print("\n[7.5] Stage 4: Fine-tuning with reduced sparsity...")
     dashred, history2 = train_hf_sparse(
         dashred, train_loader_real, sensor_indices,
-        epochs=200, lambda_sparse=lambda_sparse * 0.1, sparsity_type=sparsity_type,
+        epochs=HF_FINE_TUNE_EPOCHS, lambda_sparse=lambda_sparse * 0.1, sparsity_type=sparsity_type,
         stage_name="Stage 4 (Fine-tune)"
     )
     

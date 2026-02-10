@@ -43,3 +43,8 @@ the output of `rde1d_3_waves.py` should be a `Kochs_model_dataset.npy` file whic
 3. (Optional, requires 2.) Review the baseline results notebook to understand the approach
 
 4. Run the main model using `Cheap2Rich.py`
+## MAMBA-style discovery
+
+The `mamba-discovery` branch builds multi-scale Ricker features for each sensor, fits a ridge model on those features, and reports derivative metrics/coefficients in `reports/mamba_results.md`. It also saves derivative-reconstruction plots (e.g., `reports/mamba_Koch_values.png`) so you can compare the predicted dx/dt to the measured waveform.
+
+![MAMBA Koch comparison](reports/mamba_Koch_values.png)

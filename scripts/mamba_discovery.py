@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.linear_model import Ridge
 
@@ -41,6 +42,27 @@ def multi_scale_features(X: np.ndarray, include_values: bool) -> tuple[np.ndarra
     return np.concatenate(features, axis=1), names
 
 
+def plot_mamba(name: str, actual: np.ndarray, predicted: np.ndarray) -> None:
+    idx = SENSOR_INDICES[0]
+    t = np.arange(actual.shape[0]) * DT
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    axes[0].plot(t, actual[:, idx], label="True dx/dt")
+    axes[0].plot(t, predicted[:, idx], label="MAMBA predict", linestyle="--")
+    axes[0].set_ylabel("Derivative")
+    axes[0].legend()
+
+    axes[1].plot(t, actual[:, idx] - predicted[:, idx], color="tab:purple")
+    axes[1].set_ylabel("Error")
+    axes[1].set_xlabel("Time")
+
+    Path("reports").mkdir(exist_ok=True)
+    plot_path = Path("reports") / f"mamba_{name.replace(' ', '_')}.png"
+    fig.suptitle(f"{name} derivative comparison")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(plot_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def run_mamba(name: str, data: np.ndarray, include_values: bool) -> dict:
     X = data[:, SENSOR_INDICES]
     dXdt = np.gradient(X, axis=0) / DT
@@ -57,6 +79,9 @@ def run_mamba(name: str, data: np.ndarray, include_values: bool) -> dict:
 
     coef_norm = np.linalg.norm(model.coef_, axis=0)
     top_feats = [names[i] for i in np.argsort(-coef_norm)[:5]]
+
+    tag = f"{name}_{'values' if include_values else 'cwt'}"
+    plot_mamba(tag, dXdt, predictions)
 
     return {
         "name": name,
@@ -88,7 +113,8 @@ def main() -> None:
             md.write(f"- Feature count: {entry['num_features']}\n")
             md.write(f"- Derivative MSE: {entry['mse']:.6e}\n")
             md.write(f"- Score: {entry['score']:.4f}\n")
-            md.write(f"- Top features: {entry['top_features']}\n\n")
+            md.write(f"- Top features: {entry['top_features']}\n")
+            md.write(f"![{entry['name']} {entry['mode']} derivative](mamba_{entry['name']}_{'values' if entry['mode']== 'cwt+values' else 'cwt-only'}.png)\n\n")
 
     print(f"MAMBA discovery finished. Report at {OUTPUT_MD}")
 

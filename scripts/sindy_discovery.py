@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pysindy as ps
 
@@ -11,7 +12,6 @@ DATA = {
 
 SENSOR_INDICES = [0, 25, 50, 75, 99]
 DT = 0.1
-
 OUTPUT_JSON = "reports/sindy_results.json"
 OUTPUT_MD = "reports/sindy_results.md"
 
@@ -34,6 +34,7 @@ def fit_sindy(name: str, data: np.ndarray) -> dict:
     score = float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
 
     eqns = model.equations()
+    plot_derivative(name, dXdt, predictions)
 
     return {
         "name": name,
@@ -44,22 +45,44 @@ def fit_sindy(name: str, data: np.ndarray) -> dict:
     }
 
 
+def plot_derivative(name: str, actual: np.ndarray, predicted: np.ndarray) -> None:
+    idx = SENSOR_INDICES[0]
+    t = np.arange(actual.shape[0]) * DT
+    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    axes[0].plot(t, actual[:, idx], label="True dx/dt")
+    axes[0].plot(t, predicted[:, idx], label="SINDy prediction", linestyle="--")
+    axes[0].set_ylabel("Derivative")
+    axes[0].legend()
+
+    axes[1].plot(t, actual[:, idx] - predicted[:, idx], color="tab:red")
+    axes[1].set_ylabel("Error")
+    axes[1].set_xlabel("Time")
+    axes[1].set_title("Sensor {} residual".format(idx))
+
+    Path("reports").mkdir(exist_ok=True)
+    plot_path = Path("reports") / f"sindy_{name.replace(' ', '_')}.png"
+    fig.suptitle(f"{name} derivative comparison")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(plot_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     results = []
+    Path("reports").mkdir(exist_ok=True)
     for label, filename in DATA.items():
         data = np.load(Path(filename))
         results.append(fit_sindy(label, data))
 
     koch = np.load(Path(DATA["Koch"]))
     real = np.load(Path(DATA["HighFidelity"]))
-    diff = real - koch
-    results.append(fit_sindy("Residual", diff))
+    residual = real - koch
+    results.append(fit_sindy("Residual", residual))
 
-    Path("reports").mkdir(exist_ok=True)
-    with open(OUTPUT_JSON, "w") as f_json:
+    with open(Path(OUTPUT_JSON), "w") as f_json:
         json.dump(results, f_json, indent=2)
 
-    with open(OUTPUT_MD, "w") as f_md:
+    with open(Path(OUTPUT_MD), "w") as f_md:
         f_md.write("# SINDy Discovery Report\n\n")
         f_md.write(f"Sensor indices: {SENSOR_INDICES}\n\n")
         for entry in results:
@@ -67,10 +90,7 @@ def main() -> None:
             f_md.write(f"- Derivative MSE: {entry['mse_derivative']:.6e}\n")
             f_md.write(f"- Score (R²-like): {entry['score']:.4f}\n")
             f_md.write(f"- Number of active terms: {entry['num_terms']}\n")
-            f_md.write("- Equations to describe dx/dt:\n")
-            for eq in entry["equations"]:
-                f_md.write(f"  - `{eq}`\n")
-            f_md.write("\n")
+            f_md.write(f"![{entry['name']} derivative comparison](sindy_{entry['name'].replace(' ', '_')}.png)\n\n")
 
     print(f"SINDy discovery completed. Results -> {OUTPUT_MD}")
 

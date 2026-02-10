@@ -43,3 +43,8 @@ the output of `rde1d_3_waves.py` should be a `Kochs_model_dataset.npy` file whic
 3. (Optional, requires 2.) Review the baseline results notebook to understand the approach
 
 4. Run the main model using `Cheap2Rich.py`
+## SINDy physics discovery
+
+The `sindy-discovery` branch runs PySINDy on the Koch simulation, the high-fidelity measurement, and their residual to recover sparse polynomial equations in the chosen sensor coordinates. Each run saves a derivative comparison plot (`reports/sindy_<Label>.png`) so you can visually compare the predicted derivatives to the measured value for the first sensor.
+
+![SINDy derivative comparison](reports/sindy_Koch.png)

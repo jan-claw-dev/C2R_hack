@@ -335,33 +335,23 @@ class HF_SHRED(nn.Module):
         return None
 
 
-class LatentGAN(nn.Module):
-    """GAN for latent alignment"""
+class LatentContrastive(nn.Module):
+    """Latent contrastive aligner for LF embeddings."""
 
-    def __init__(self, latent_dim, hidden_dim=64):
+    def __init__(self, latent_dim, proj_dim=64, temperature=0.07):
         super().__init__()
-
-        self.generator = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, latent_dim)
-        )
-        with torch.no_grad():
-            self.generator[-1].weight.mul_(0.1)
-            self.generator[-1].bias.zero_()
-
-        self.discriminator = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Linear(hidden_dim, 1)
+        self.temperature = temperature
+        self.projector = nn.Sequential(
+            nn.Linear(latent_dim, proj_dim),
+            nn.ReLU(),
+            nn.Linear(proj_dim, latent_dim)
         )
 
     def forward(self, z):
-        return z + self.generator(z)
+        return z + self.projector(z)
+
+    def project(self, z):
+        return F.normalize(self.projector(z), dim=-1)
 
 
 LF_EPOCHS = 160
@@ -379,7 +369,7 @@ class SparseFreqDASHRED(nn.Module):
         self.lf_lstm = copy.deepcopy(lf_shred.lstm)
         self.lf_norm = copy.deepcopy(lf_shred.norm)
         self.lf_decoder = copy.deepcopy(lf_shred.decoder)
-        self.gan = LatentGAN(lf_shred.hidden_size)
+        self.latent_aligner = LatentContrastive(lf_shred.hidden_size, proj_dim=64)
 
         # HF pathway with enhanced temporal processing + spatial deformation
         # The HF patterns have spatially and temporally varying velocity
@@ -407,7 +397,7 @@ class SparseFreqDASHRED(nn.Module):
         # LF pathway
         z_lf = self.encode_lf(sensor_history)
         if use_gan:
-            z_lf = self.gan(z_lf)
+            z_lf = self.latent_aligner(z_lf)
         u_lf = self.decode_lf(z_lf)
 
         # Compute residual history
@@ -447,49 +437,46 @@ def train_lf_shred(model, train_loader, epochs=200, lr=1e-3):
     return model
 
 
-def train_gan(dashred, z_sim, z_real, epochs=300, lr=1e-4):
-    print("\n=== Stage 2: Train GAN for LF Alignment ===")
+def train_contrastive(dashred, z_sim, z_real, epochs=300, lr=1e-4):
+    print("=== Stage 2: Contrastive LF alignment ===")
 
     z_sim = torch.tensor(z_sim, dtype=torch.float32).to(device)
     z_real = torch.tensor(z_real, dtype=torch.float32).to(device)
 
-    opt_g = optim.Adam(dashred.gan.generator.parameters(), lr=lr)
-    opt_d = optim.Adam(dashred.gan.discriminator.parameters(), lr=lr)
-
-    batch_size = 32
-    n_batches = min(len(z_sim), len(z_real)) // batch_size
+    optimizer = optim.Adam(dashred.latent_aligner.projector.parameters(), lr=lr)
+    batch_size = 64
+    n_batches = max(min(len(z_sim), len(z_real)) // batch_size, 1)
 
     for epoch in range(epochs):
-        perm_sim = torch.randperm(len(z_sim))
-        perm_real = torch.randperm(len(z_real))
+        perm = torch.randperm(len(z_sim))
+        z_sim_perm = z_sim[perm]
+        z_real_perm = z_real[perm]
+
+        epoch_loss = 0.0
 
         for i in range(n_batches):
-            z_s = z_sim[perm_sim[i * batch_size:(i + 1) * batch_size]]
-            z_r = z_real[perm_real[i * batch_size:(i + 1) * batch_size]]
+            start = i * batch_size
+            end = start + batch_size
+            z_s = z_sim_perm[start:end]
+            z_r = z_real_perm[start:end]
 
-            # Discriminator
-            opt_d.zero_grad()
-            z_fake = dashred.gan(z_s)
-            d_loss = F.binary_cross_entropy_with_logits(
-                dashred.gan.discriminator(z_r), torch.ones(len(z_r), 1, device=device)
-            ) + F.binary_cross_entropy_with_logits(
-                dashred.gan.discriminator(z_fake.detach()), torch.zeros(len(z_s), 1, device=device)
-            )
-            d_loss.backward()
-            opt_d.step()
+            proj_s = dashred.latent_aligner.project(z_s)
+            proj_r = dashred.latent_aligner.project(z_r)
 
-            # Generator
-            opt_g.zero_grad()
-            z_fake = dashred.gan(z_s)
-            g_loss = F.binary_cross_entropy_with_logits(
-                dashred.gan.discriminator(z_fake), torch.ones(len(z_s), 1, device=device)
-            )
-            g_loss.backward()
-            opt_g.step()
+            logits = torch.matmul(proj_s, proj_r.T) / dashred.latent_aligner.temperature
+            labels = torch.arange(len(logits), device=device)
+
+            loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
 
         if (epoch + 1) % 100 == 0:
-            print(f"  Epoch {epoch + 1}/{epochs}, G_loss: {g_loss.item():.4f}, D_loss: {d_loss.item():.4f}")
-
+            avg = epoch_loss / n_batches
+            print(f"  Epoch {epoch + 1}/{epochs}, Loss: {avg:.4f}")
 
 def train_hf_sparse(dashred, train_loader_real, sensor_indices, epochs=500, lr=1e-3,
                     lambda_sparse=0.1, sparsity_type='bandlimited', stage_name="Stage 3"):
@@ -778,12 +765,11 @@ if __name__ == "__main__":
     # Diagnostic: Check latent distribution difference
     print(f"    Z_sim mean: {Z_sim.mean():.4f}, std: {Z_sim.std():.4f}")
     print(f"    Z_real mean: {Z_real.mean():.4f}, std: {Z_real.std():.4f}")
+    print("\n[6] Stage 2: Contrastive alignment...")
+    train_contrastive(dashred, Z_sim, Z_real, epochs=GAN_EPOCHS)
+    time_to_train_contrastive = time.time() - start_time - time_to_train_lf
+    print(f"    Time to train contrastive aligner: {time_to_train_contrastive:.2f} seconds ({time_to_train_contrastive/60:.2f} minutes)")
 
-    print("\n[6] Stage 2: Train GAN...")
-    train_gan(dashred, Z_sim, Z_real, epochs=GAN_EPOCHS)
-    time_to_train_gan = time.time() - start_time - time_to_train_lf
-    print(f"    Time to train GAN: {time_to_train_gan:.2f} seconds ({time_to_train_gan/60:.2f} minutes)")
-    
 
     # Diagnostic: Check sensor residual
     print("\n[6.5] DIAGNOSTIC: Checking sensor residual...")
@@ -795,7 +781,7 @@ if __name__ == "__main__":
         sample_targets = sample_targets.to(device)
 
         z_lf = dashred.encode_lf(sample_sensors)
-        z_lf_aligned = dashred.gan(z_lf)
+        z_lf_aligned = dashred.latent_aligner(z_lf)
         u_lf = dashred.decode_lf(z_lf_aligned)
 
         sensors_current = sample_sensors[:, -1, :]
@@ -834,7 +820,7 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in dashred.parameters())
     trainable_params = sum(p.numel() for p in dashred.parameters() if p.requires_grad)
     print(f"\n[Summary] Total parameters in DA-SHRED: {total_params}, Trainable parameters: {trainable_params}")
-    time_to_train_hf = time.time() - start_time - time_to_train_lf - time_to_train_gan
+    time_to_train_hf = time.time() - start_time - time_to_train_lf - time_to_train_contrastive
     print(f"    Time to train HF-SHRED: {time_to_train_hf:.2f} seconds ({time_to_train_hf/60:.2f} minutes)")
 
     # Evaluate
@@ -848,7 +834,7 @@ if __name__ == "__main__":
             sensors = sensors.to(device)
 
             z_lf = dashred.encode_lf(sensors)
-            z_lf_aligned = dashred.gan(z_lf)
+            z_lf_aligned = dashred.latent_aligner(z_lf)
             u_lf = dashred.decode_lf(z_lf_aligned)
 
             u_total, _, u_hf, _, _ = dashred(sensors, use_gan=True)
@@ -1073,7 +1059,7 @@ if __name__ == "__main__":
         for sensors, targets in full_real_loader:
             sensors = sensors.to(device)
             z_lf = dashred.encode_lf(sensors)
-            z_lf_aligned = dashred.gan(z_lf)
+            z_lf_aligned = dashred.latent_aligner(z_lf)
             u_lf = dashred.decode_lf(z_lf_aligned)
             u_total, _, _, _, _ = dashred(sensors, use_gan=True)
             full_results['lf_only'].append(u_lf.cpu())

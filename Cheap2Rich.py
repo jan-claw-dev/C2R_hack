@@ -128,6 +128,29 @@ class TemporalConvNet(nn.Module):
         out = self.net(x.transpose(1, 2))
         return out.transpose(1, 2)
 
+
+class FrequencyAttention(nn.Module):
+    """Frequency-aware gating on HF outputs."""
+
+    def __init__(self, output_size, hidden_dim=16):
+        super().__init__()
+        self.output_size = output_size
+        self.freq_bins = output_size // 2 + 1
+        self.net = nn.Sequential(
+            nn.Linear(2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, output):
+        fft = torch.fft.rfft(output, dim=-1)
+        batch = fft.shape[0]
+        freq_feats = torch.stack([fft.real, fft.imag], dim=-1).reshape(-1, 2)
+        gates = self.net(freq_feats).view(batch, self.freq_bins)
+        fft = fft * gates
+        return torch.fft.irfft(fft, n=output.shape[-1], dim=-1)
+
 class HF_SHRED(nn.Module):
     """
     HF-SHRED for high-frequency residual learning.
@@ -140,7 +163,8 @@ class HF_SHRED(nn.Module):
 
     def __init__(self, num_sensors, lags, hidden_size, output_size,
                  velocity_correction='deformation', use_time_derivatives=True, use_lag_attention=True,
-                 use_temporal_conv=False, conv_dim=64, use_hf_gate=False):
+                 use_temporal_conv=False, conv_dim=64, use_hf_gate=False, use_frequency_attention=False,
+                 freq_gate_dim=16):
         super().__init__()
         self.hidden_size = hidden_size
         self.output_size = output_size
@@ -214,6 +238,12 @@ class HF_SHRED(nn.Module):
             )
 
         self.scale = nn.Parameter(torch.tensor(0.5))
+        self.use_frequency_attention = use_frequency_attention
+        if use_frequency_attention:
+            self.frequency_attention = FrequencyAttention(output_size, hidden_dim=freq_gate_dim)
+        else:
+            self.frequency_attention = None
+
 
     def compute_time_derivatives(self, x):
         """Compute temporal derivatives from sensor history."""
@@ -326,6 +356,9 @@ class HF_SHRED(nn.Module):
             gate = self.gate_net(z)
             output = output * gate
 
+        if self.use_frequency_attention:
+            output = self.frequency_attention(output)
+
         return output, z
 
     def get_attention_weights(self):
@@ -387,7 +420,8 @@ class SparseFreqDASHRED(nn.Module):
                                  velocity_correction='deformation',  # Spatially-varying warping
                                  use_time_derivatives=True,
                                  use_lag_attention=True,
-                                 use_temporal_conv=True, conv_dim=64, use_hf_gate=True)
+                                 use_temporal_conv=True, conv_dim=64, use_hf_gate=True,
+                                 use_frequency_attention=True, freq_gate_dim=32)
 
         self.register_buffer('sensor_indices', torch.tensor(sensor_indices, dtype=torch.long))
         self.lags = lags

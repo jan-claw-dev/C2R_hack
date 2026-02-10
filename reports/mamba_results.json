@@ -1,0 +1,58 @@
+[
+  {
+    "name": "Koch",
+    "mode": "cwt+values",
+    "mse": 1.3753653631458571e-05,
+    "score": 0.369164434033474,
+    "top_features": [
+      "x75_cwt_w16",
+      "x0_cwt_w16",
+      "x99_cwt_w16",
+      "x50_cwt_w16",
+      "u75"
+    ],
+    "num_features": 25
+  },
+  {
+    "name": "Koch",
+    "mode": "cwt-only",
+    "mse": 1.3959403344399373e-05,
+    "score": 0.359727360795452,
+    "top_features": [
+      "x75_cwt_w16",
+      "x0_cwt_w16",
+      "x99_cwt_w16",
+      "x50_cwt_w16",
+      "x75_cwt_w8"
+    ],
+    "num_features": 20
+  },
+  {
+    "name": "HighFidelity",
+    "mode": "cwt+values",
+    "mse": 0.15144919168974885,
+    "score": 0.2883026861217385,
+    "top_features": [
+      "x99_cwt_w2",
+      "u99",
+      "x0_cwt_w2",
+      "u0",
+      "x25_cwt_w2"
+    ],
+    "num_features": 25
+  },
+  {
+    "name": "HighFidelity",
+    "mode": "cwt-only",
+    "mse": 0.15475774287136798,
+    "score": 0.2727549835390084,
+    "top_features": [
+      "x99_cwt_w2",
+      "x0_cwt_w2",
+      "x25_cwt_w2",
+      "x50_cwt_w2",
+      "x0_cwt_w4"
+    ],
+    "num_features": 20
+  }
+]
